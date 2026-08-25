@@ -3,7 +3,13 @@ import sys
 import unittest
 from unittest.mock import patch
 
-from baidu_proxy import DEFAULT_X_T5_AUTH, ProxyConfig, ProxyServer, parse_args
+from baidu_proxy import (
+    DEFAULT_BENCHMARK_UPLOAD_URL,
+    DEFAULT_X_T5_AUTH,
+    ProxyConfig,
+    ProxyServer,
+    parse_args,
+)
 
 
 class FakeUpstream:
@@ -47,6 +53,11 @@ class ProxyTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(sys, "argv", ["baidu_proxy.py"]):
             config = parse_args()
         self.assertEqual(config.x_t5_auth, DEFAULT_X_T5_AUTH)
+        self.assertEqual(config.benchmark_upload_url, DEFAULT_BENCHMARK_UPLOAD_URL)
+        self.assertTrue(config.benchmark_upload_enabled)
+        with patch.object(sys, "argv", ["baidu_proxy.py", "--no-benchmark-upload"]):
+            config = parse_args()
+        self.assertFalse(config.benchmark_upload_enabled)
 
     async def asyncSetUp(self):
         self.upstream = FakeUpstream()

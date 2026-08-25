@@ -83,24 +83,27 @@ Use `--benchmark-url URL` to replace the download target, and
 `--benchmark-timeout SECONDS` to bound each connection, tunnel, or read
 operation. The result table is printed to stdout only.
 
-Upload testing is opt-in because the download URL cannot accept an upload.
-Pass an HTTP/HTTPS endpoint that accepts upload data, or use the Apple CDN
-endpoint used by iNetSpeed-CLI:
+The benchmark uses the Apple CDN upload endpoint from iNetSpeed-CLI by default;
+the download URL itself cannot accept an upload:
 
 ```sh
 python3 baidu_proxy.py \
   --benchmark \
   --upstream-ip 180.101.50.208 \
-  --benchmark-upload-url https://mensura.cdn-apple.com/api/v1/gm/slurp \
   --benchmark-upload-bytes 8388608
 ```
 
 The Apple endpoint uses `PUT` with chunked transfer encoding, which is the
-default. For a generic POST endpoint, add `--benchmark-upload-method POST`.
+default. To use another endpoint, pass `--benchmark-upload-url URL`; for a
+generic POST endpoint, also add `--benchmark-upload-method POST`.
 The program sends zero-filled chunks through the selected cloudnproxy IP,
 waits for the upload endpoint's response, calculates `upload_mbps`, and then
 discards everything. It does not use the installer download URL for uploads;
 that URL is a GET-only resource and would not provide a valid upload speed.
+
+Use `--no-benchmark-upload` when you want to run only the download and latency
+tests. With the default 2 MiB cap, a full benchmark uploads up to 2 MiB per
+candidate IP.
 
 The `iNetSpeed-CLI --endpoint` option and this program's `--upstream-ip` have
 different meanings. iNetSpeed's endpoint is an Apple CDN address; here,

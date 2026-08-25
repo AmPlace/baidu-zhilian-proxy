@@ -34,6 +34,7 @@ DEFAULT_BENCHMARK_BYTES = 2 * 1024 * 1024
 DEFAULT_BENCHMARK_TIMEOUT = 15.0
 DEFAULT_BENCHMARK_WORKERS = 8
 DEFAULT_BENCHMARK_UPLOAD_BYTES = 2 * 1024 * 1024
+DEFAULT_BENCHMARK_UPLOAD_URL = "https://mensura.cdn-apple.com/api/v1/gm/slurp"
 DEFAULT_BENCHMARK_URL = (
     "https://desk.ctyun.cn:8999/desktop-prod/software/windows_tob_client/15/64/"
     "202030001/CtyunClouddeskUniversal_2.3.0_202030001_x86_20240327104015_Setup.exe"
@@ -87,9 +88,10 @@ class ProxyConfig:
     benchmark_bytes: int = DEFAULT_BENCHMARK_BYTES
     benchmark_timeout: float = DEFAULT_BENCHMARK_TIMEOUT
     benchmark_workers: int = DEFAULT_BENCHMARK_WORKERS
-    benchmark_upload_url: str = ""
+    benchmark_upload_url: str = DEFAULT_BENCHMARK_UPLOAD_URL
     benchmark_upload_bytes: int = DEFAULT_BENCHMARK_UPLOAD_BYTES
     benchmark_upload_method: str = "PUT"
+    benchmark_upload_enabled: bool = True
 
 
 def format_authority(host: str, port: int) -> str:
@@ -495,7 +497,7 @@ def benchmark_candidate(
         result["download_url"] = final_url
     except (BenchmarkError, OSError, ssl.SSLError) as exc:
         errors.append(f"download: {exc}")
-    if config.benchmark_upload_url:
+    if config.benchmark_upload_enabled and config.benchmark_upload_url:
         try:
             uploaded, elapsed = benchmark_upload(
                 config, endpoint, config.benchmark_upload_url
@@ -866,8 +868,8 @@ def parse_args() -> ProxyConfig:
     )
     parser.add_argument(
         "--benchmark-upload-url",
-        default="",
-        help="optional HTTP/HTTPS upload endpoint; disabled by default",
+        default=DEFAULT_BENCHMARK_UPLOAD_URL,
+        help="HTTP/HTTPS upload endpoint (defaults to the iNetSpeed Apple endpoint)",
     )
     parser.add_argument(
         "--benchmark-upload-bytes",
@@ -880,6 +882,12 @@ def parse_args() -> ProxyConfig:
         choices=("PUT", "POST"),
         default="PUT",
         help="HTTP method for the upload endpoint (iNetSpeed Apple endpoint uses PUT)",
+    )
+    parser.add_argument(
+        "--no-benchmark-upload",
+        dest="benchmark_upload_enabled",
+        action="store_false",
+        help="skip the upload test while running --benchmark",
     )
     args = parser.parse_args()
     for endpoint in args.upstream_ips:
