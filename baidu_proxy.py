@@ -84,6 +84,7 @@ class ProxyConfig:
     upstream_port: int = DEFAULT_UPSTREAM_PORT
     upstream_ips: Tuple[str, ...] = ()
     benchmark_proxy: str = ""
+    benchmark_proxy_chain: bool = False
     x_t5_auth: str = ""
     connect_timeout: float = 15.0
     upstream_tls: bool = False
@@ -413,25 +414,27 @@ def benchmark_open_upstream(config: ProxyConfig, endpoint: str) -> socket.socket
             (endpoint, config.upstream_port), timeout=config.benchmark_timeout
         )
         sock.settimeout(config.benchmark_timeout)
-        if config.upstream_tls:
-            context = ssl.create_default_context()
-            try:
-                sock = context.wrap_socket(sock, server_hostname=config.upstream_host)
-                sock.settimeout(config.benchmark_timeout)
-            except Exception:
-                sock.close()
-                raise
-        return sock
     except (OSError, ssl.SSLError) as exc:
         raise BenchmarkError(f"cannot connect to upstream: {exc}") from exc
+    return benchmark_wrap_upstream_tls(config, sock)
 
 
-def benchmark_open_tunnel(
-    config: ProxyConfig, endpoint: str, target_host: str, target_port: int
+def benchmark_wrap_upstream_tls(config: ProxyConfig, sock: socket.socket) -> socket.socket:
+    if not config.upstream_tls:
+        return sock
+    try:
+        context = ssl.create_default_context()
+        sock = context.wrap_socket(sock, server_hostname=config.upstream_host)
+        sock.settimeout(config.benchmark_timeout)
+        return sock
+    except (OSError, ssl.SSLError) as exc:
+        sock.close()
+        raise BenchmarkError(f"cannot establish upstream TLS: {exc}") from exc
+
+
+def benchmark_open_baidu_tunnel(
+    config: ProxyConfig, sock: socket.socket, target_host: str, target_port: int
 ) -> socket.socket:
-    if config.benchmark_proxy:
-        return benchmark_open_external_tunnel(config, target_host, target_port)
-    sock = benchmark_open_upstream(config, endpoint)
     request = (
         f"CONNECT {format_authority(target_host, target_port)} HTTP/1.1\r\n"
         "Host: ascdn.baidu.com\r\n"
@@ -450,6 +453,19 @@ def benchmark_open_tunnel(
     except (OSError, UnicodeError, ssl.SSLError, BenchmarkError):
         sock.close()
         raise
+
+
+def benchmark_open_tunnel(
+    config: ProxyConfig, endpoint: str, target_host: str, target_port: int
+) -> socket.socket:
+    if config.benchmark_proxy_chain:
+        sock = benchmark_open_external_tunnel(config, endpoint, config.upstream_port)
+        sock = benchmark_wrap_upstream_tls(config, sock)
+        return benchmark_open_baidu_tunnel(config, sock, target_host, target_port)
+    if config.benchmark_proxy:
+        return benchmark_open_external_tunnel(config, target_host, target_port)
+    sock = benchmark_open_upstream(config, endpoint)
+    return benchmark_open_baidu_tunnel(config, sock, target_host, target_port)
 
 
 def benchmark_tcping(host: str, port: int, timeout: float) -> float:
@@ -474,6 +490,13 @@ def benchmark_proxy_tcping(
 def benchmark_external_proxy_tcping(config: ProxyConfig) -> float:
     _, host, port, _, _ = benchmark_proxy_parts(config.benchmark_proxy)
     return benchmark_tcping(host, port, config.benchmark_timeout)
+
+
+def benchmark_chain_ip_tcping(config: ProxyConfig, endpoint: str) -> float:
+    started = time.perf_counter()
+    sock = benchmark_open_external_tunnel(config, endpoint, config.upstream_port)
+    sock.close()
+    return round((time.perf_counter() - started) * 1000, 1)
 
 
 def benchmark_url_parts(url: str) -> Tuple[str, str, int, str]:
@@ -668,7 +691,9 @@ def benchmark_candidate(
         (
             "ip_tcp_ms",
             (
-                (lambda: benchmark_external_proxy_tcping(config))
+                (lambda: benchmark_chain_ip_tcping(config, endpoint))
+                if config.benchmark_proxy_chain
+                else (lambda: benchmark_external_proxy_tcping(config))
                 if config.benchmark_proxy
                 else lambda: benchmark_tcping(
                     endpoint, config.upstream_port, config.benchmark_timeout
@@ -793,7 +818,11 @@ def print_benchmark_table(results: list[dict[str, object]]) -> None:
 
 
 def run_benchmark(config: ProxyConfig) -> None:
-    if config.benchmark_proxy:
+    if config.benchmark_proxy_chain:
+        candidates = list(BUILTIN_UPSTREAM_IPS)
+        if config.upstream_ips:
+            candidates = [(endpoint, "custom") for endpoint in config.upstream_ips]
+    elif config.benchmark_proxy:
         candidates = [("custom-proxy", benchmark_proxy_display(config.benchmark_proxy))]
     elif config.upstream_ips:
         candidates = [(endpoint, "custom") for endpoint in config.upstream_ips]
@@ -1104,6 +1133,11 @@ def parse_args() -> ProxyConfig:
         help="benchmark through an external http://, socks5://, or socks5h:// proxy",
     )
     parser.add_argument(
+        "--benchmark-proxy-chain",
+        action="store_true",
+        help="route the built-in cloudnproxy benchmark through --benchmark-proxy first",
+    )
+    parser.add_argument(
         "--x-t5-auth",
         default=os.environ.get("BAIDU_X_T5_AUTH", DEFAULT_X_T5_AUTH),
         help="X-T5-Auth value; overrides the built-in Lua value",
@@ -1202,6 +1236,8 @@ def parse_args() -> ProxyConfig:
             benchmark_proxy_parts(args.benchmark_proxy)
         except BenchmarkError as exc:
             parser.error(str(exc))
+    if args.benchmark_proxy_chain and not args.benchmark_proxy:
+        parser.error("--benchmark-proxy-chain requires --benchmark-proxy")
     args.upstream_ips = tuple(args.upstream_ips)
     return ProxyConfig(**vars(args))
 

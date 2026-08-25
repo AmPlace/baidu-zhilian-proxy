@@ -13,6 +13,7 @@ from baidu_proxy import (
     ProxyConfig,
     ProxyServer,
     benchmark_open_external_tunnel,
+    benchmark_open_tunnel,
     benchmark_proxy_display,
     benchmark_socks_address,
     parse_args,
@@ -88,6 +89,7 @@ class BenchmarkProxyTests(unittest.TestCase):
         self.assertTrue(config.benchmark_upload_enabled)
         self.assertEqual(config.benchmark_threads, 1)
         self.assertEqual(config.benchmark_proxy, "")
+        self.assertFalse(config.benchmark_proxy_chain)
         self.assertFalse(config.benchmark_details)
         with patch.object(sys, "argv", ["baidu_proxy.py", "--no-benchmark-upload"]):
             config = parse_args()
@@ -95,10 +97,16 @@ class BenchmarkProxyTests(unittest.TestCase):
         with patch.object(
             sys,
             "argv",
-            ["baidu_proxy.py", "--benchmark-proxy", "socks5h://user:pass@127.0.0.1:1080"],
+            [
+                "baidu_proxy.py",
+                "--benchmark-proxy",
+                "socks5h://user:pass@127.0.0.1:1080",
+                "--benchmark-proxy-chain",
+            ],
         ):
             config = parse_args()
         self.assertEqual(config.benchmark_proxy, "socks5h://user:pass@127.0.0.1:1080")
+        self.assertTrue(config.benchmark_proxy_chain)
 
     def test_benchmark_proxy_display_hides_credentials(self):
         self.assertEqual(
@@ -147,9 +155,42 @@ class BenchmarkProxyTests(unittest.TestCase):
         )
         self.assertFalse(fake.closed)
 
+    def test_chain_connects_external_proxy_to_baidu_proxy(self):
+        response = (
+            b"\x05\x00"
+            b"\x05\x00\x00\x01\x7f\x00\x00\x01\x1a\xe1"
+            b"HTTP/1.1 200 Connection established\r\n\r\n"
+        )
+        fake = FakeSocket(response)
+        config = ProxyConfig(
+            benchmark_proxy="socks5h://127.0.0.1:1080",
+            benchmark_proxy_chain=True,
+            x_t5_auth="test-auth",
+        )
+        with patch("baidu_proxy.socket.create_connection", return_value=fake):
+            self.assertIs(
+                benchmark_open_tunnel(
+                    config, "198.51.100.10", "www.baidu.com", 443
+                ),
+                fake,
+            )
+        self.assertEqual(fake.sent[0], b"\x05\x01\x00")
+        self.assertEqual(
+            fake.sent[1], b"\x05\x01\x00\x01\xc63\x64\x0a\x01\xbb"
+        )
+        self.assertIn(b"CONNECT www.baidu.com:443 HTTP/1.1", fake.sent[2])
+        self.assertIn(b"X-T5-Auth: test-auth", fake.sent[2])
+        self.assertFalse(fake.closed)
+
     def test_invalid_benchmark_proxy_is_rejected(self):
         with patch.object(
             sys, "argv", ["baidu_proxy.py", "--benchmark-proxy", "ftp://127.0.0.1:21"]
+        ):
+            with self.assertRaises(SystemExit):
+                parse_args()
+
+        with patch.object(
+            sys, "argv", ["baidu_proxy.py", "--benchmark-proxy-chain"]
         ):
             with self.assertRaises(SystemExit):
                 parse_args()
@@ -182,6 +223,22 @@ class BenchmarkProxyTests(unittest.TestCase):
         )
         self.assertIn("socks5h://127.0.0.1:1080", output.getvalue())
         self.assertNotIn("secret", output.getvalue())
+
+    def test_benchmark_proxy_chain_keeps_bgp_candidates(self):
+        config = ProxyConfig(
+            benchmark=True,
+            benchmark_proxy="socks5h://127.0.0.1:1080",
+            benchmark_proxy_chain=True,
+        )
+        result = {"ip": "198.51.100.10", "region": "test", "errors": []}
+        with patch(
+            "baidu_proxy.BUILTIN_UPSTREAM_IPS",
+            (("198.51.100.10", "test"),),
+        ):
+            with patch("baidu_proxy.benchmark_candidate", return_value=result) as candidate:
+                with redirect_stdout(StringIO()):
+                    run_benchmark(config)
+        candidate.assert_called_once_with(("198.51.100.10", "test"), config)
 
     def test_benchmark_table_hides_raw_failures(self):
         result = {

@@ -128,11 +128,29 @@ hostnames locally; `socks5h` keeps target DNS at the SOCKS5 proxy.
 In this mode, `ip_tcp_ms` is the TCP latency to the external proxy listener,
 `baidu_direct_tcp_ms` remains a direct connection from the benchmark host, and
 `baidu_via_proxy_ms` is the full connection through that external proxy.
-`--upstream-ip` is ignored when `--benchmark-proxy` is set.
+`--upstream-ip` is ignored when `--benchmark-proxy` is set by itself.
 The no-`--benchmark-proxy` mode tests the literal built-in BGP IP list; those
 rows are already IP addresses and therefore do not use DNS. Use the
 `socks5h://` mode when the proxy itself must resolve a hostname such as
 `cloudnproxy.baidu.com`.
+
+To chain the external proxy first and then use the built-in Baidu CONNECT
+proxy, add `--benchmark-proxy-chain`:
+
+```sh
+python3 baidu_proxy.py \
+  --benchmark \
+  --benchmark-proxy socks5h://127.0.0.1:1080 \
+  --benchmark-proxy-chain \
+  --benchmark-workers 1 \
+  --benchmark-threads 4
+```
+
+Chain mode keeps the built-in BGP IP candidates, or uses repeated
+`--upstream-ip` values when provided. Each transfer goes through
+`SOCKS5/HTTP proxy -> cloudnproxy BGP IP -> Baidu CONNECT -> target`.
+`--benchmark-proxy` without `--benchmark-proxy-chain` remains the direct
+external-proxy benchmark and does not use cloudnproxy.
 
 The benchmark uses the Apple CDN upload endpoint from iNetSpeed-CLI by default;
 the download URL itself cannot accept an upload:
