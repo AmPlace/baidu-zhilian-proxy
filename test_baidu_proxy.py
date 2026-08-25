@@ -55,6 +55,7 @@ class ProxyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config.x_t5_auth, DEFAULT_X_T5_AUTH)
         self.assertEqual(config.benchmark_upload_url, DEFAULT_BENCHMARK_UPLOAD_URL)
         self.assertTrue(config.benchmark_upload_enabled)
+        self.assertEqual(config.benchmark_threads, 1)
         with patch.object(sys, "argv", ["baidu_proxy.py", "--no-benchmark-upload"]):
             config = parse_args()
         self.assertFalse(config.benchmark_upload_enabled)

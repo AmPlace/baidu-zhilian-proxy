@@ -83,6 +83,24 @@ Use `--benchmark-url URL` to replace the download target, and
 `--benchmark-timeout SECONDS` to bound each connection, tunnel, or read
 operation. The result table is printed to stdout only.
 
+Use `--benchmark-threads N` for N simultaneous transfer connections per IP.
+This is separate from `--benchmark-workers`, which controls how many different
+IPs are tested at the same time. The default is one transfer connection per IP:
+
+```sh
+python3 baidu_proxy.py \
+  --benchmark \
+  --upstream-ip 180.101.50.208 \
+  --benchmark-workers 1 \
+  --benchmark-threads 4 \
+  --benchmark-bytes 8388608 \
+  --benchmark-upload-bytes 8388608
+```
+
+The byte limits apply per transfer connection, so four threads can transfer up
+to four times the configured bytes. Keeping `--benchmark-workers 1` makes a
+single-IP multi-thread result easier to compare.
+
 The benchmark uses the Apple CDN upload endpoint from iNetSpeed-CLI by default;
 the download URL itself cannot accept an upload:
 

@@ -33,6 +33,7 @@ DEFAULT_BENCHMARK_PORT = 443
 DEFAULT_BENCHMARK_BYTES = 2 * 1024 * 1024
 DEFAULT_BENCHMARK_TIMEOUT = 15.0
 DEFAULT_BENCHMARK_WORKERS = 8
+DEFAULT_BENCHMARK_THREADS = 1
 DEFAULT_BENCHMARK_UPLOAD_BYTES = 2 * 1024 * 1024
 DEFAULT_BENCHMARK_UPLOAD_URL = "https://mensura.cdn-apple.com/api/v1/gm/slurp"
 DEFAULT_BENCHMARK_URL = (
@@ -88,6 +89,7 @@ class ProxyConfig:
     benchmark_bytes: int = DEFAULT_BENCHMARK_BYTES
     benchmark_timeout: float = DEFAULT_BENCHMARK_TIMEOUT
     benchmark_workers: int = DEFAULT_BENCHMARK_WORKERS
+    benchmark_threads: int = DEFAULT_BENCHMARK_THREADS
     benchmark_upload_url: str = DEFAULT_BENCHMARK_UPLOAD_URL
     benchmark_upload_bytes: int = DEFAULT_BENCHMARK_UPLOAD_BYTES
     benchmark_upload_method: str = "PUT"
@@ -454,6 +456,50 @@ def benchmark_upload(
         sock.close()
 
 
+def benchmark_parallel_download(
+    config: ProxyConfig, endpoint: str
+) -> Tuple[int, float, list[str]]:
+    started = time.perf_counter()
+    errors: list[str] = []
+    total = 0
+    with ThreadPoolExecutor(max_workers=config.benchmark_threads) as executor:
+        futures = [
+            executor.submit(benchmark_download, config, endpoint, config.benchmark_url)
+            for _ in range(config.benchmark_threads)
+        ]
+        for future in futures:
+            try:
+                downloaded, _, _ = future.result()
+                total += downloaded
+            except (BenchmarkError, OSError, ssl.SSLError) as exc:
+                errors.append(str(exc))
+    if total == 0 and errors:
+        raise BenchmarkError("; ".join(errors))
+    return total, max(time.perf_counter() - started, 0.000001), errors
+
+
+def benchmark_parallel_upload(
+    config: ProxyConfig, endpoint: str
+) -> Tuple[int, float, list[str]]:
+    started = time.perf_counter()
+    errors: list[str] = []
+    total = 0
+    with ThreadPoolExecutor(max_workers=config.benchmark_threads) as executor:
+        futures = [
+            executor.submit(benchmark_upload, config, endpoint, config.benchmark_upload_url)
+            for _ in range(config.benchmark_threads)
+        ]
+        for future in futures:
+            try:
+                uploaded, _ = future.result()
+                total += uploaded
+            except (BenchmarkError, OSError, ssl.SSLError) as exc:
+                errors.append(str(exc))
+    if total == 0 and errors:
+        raise BenchmarkError("; ".join(errors))
+    return total, max(time.perf_counter() - started, 0.000001), errors
+
+
 def benchmark_candidate(
     candidate: Tuple[str, str], config: ProxyConfig
 ) -> dict[str, object]:
@@ -489,21 +535,20 @@ def benchmark_candidate(
             errors.append(f"{name}: {exc}")
 
     try:
-        downloaded, elapsed, final_url = benchmark_download(
-            config, endpoint, config.benchmark_url
+        downloaded, elapsed, transfer_errors = benchmark_parallel_download(
+            config, endpoint
         )
         result["download_bytes"] = downloaded
         result["download_mbps"] = round(downloaded * 8 / elapsed / 1_000_000, 2)
-        result["download_url"] = final_url
+        errors.extend(f"download thread: {exc}" for exc in transfer_errors)
     except (BenchmarkError, OSError, ssl.SSLError) as exc:
         errors.append(f"download: {exc}")
     if config.benchmark_upload_enabled and config.benchmark_upload_url:
         try:
-            uploaded, elapsed = benchmark_upload(
-                config, endpoint, config.benchmark_upload_url
-            )
+            uploaded, elapsed, transfer_errors = benchmark_parallel_upload(config, endpoint)
             result["upload_bytes"] = uploaded
             result["upload_mbps"] = round(uploaded * 8 / elapsed / 1_000_000, 2)
+            errors.extend(f"upload thread: {exc}" for exc in transfer_errors)
         except (BenchmarkError, OSError, ssl.SSLError) as exc:
             errors.append(f"upload: {exc}")
     return result
@@ -867,6 +912,12 @@ def parse_args() -> ProxyConfig:
         help="maximum number of IP benchmarks to run concurrently",
     )
     parser.add_argument(
+        "--benchmark-threads",
+        type=int,
+        default=DEFAULT_BENCHMARK_THREADS,
+        help="parallel transfer connections per IP benchmark",
+    )
+    parser.add_argument(
         "--benchmark-upload-url",
         default=DEFAULT_BENCHMARK_UPLOAD_URL,
         help="HTTP/HTTPS upload endpoint (defaults to the iNetSpeed Apple endpoint)",
@@ -901,6 +952,8 @@ def parse_args() -> ProxyConfig:
         parser.error("--benchmark-timeout must be positive")
     if args.benchmark_workers < 1:
         parser.error("--benchmark-workers must be positive")
+    if args.benchmark_threads < 1:
+        parser.error("--benchmark-threads must be positive")
     if args.benchmark_upload_bytes < 1:
         parser.error("--benchmark-upload-bytes must be positive")
     if args.benchmark_upload_url:
