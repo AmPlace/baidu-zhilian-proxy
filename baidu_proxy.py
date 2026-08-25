@@ -33,6 +33,7 @@ DEFAULT_BENCHMARK_PORT = 443
 DEFAULT_BENCHMARK_BYTES = 2 * 1024 * 1024
 DEFAULT_BENCHMARK_TIMEOUT = 15.0
 DEFAULT_BENCHMARK_WORKERS = 8
+DEFAULT_BENCHMARK_UPLOAD_BYTES = 2 * 1024 * 1024
 DEFAULT_BENCHMARK_URL = (
     "https://desk.ctyun.cn:8999/desktop-prod/software/windows_tob_client/15/64/"
     "202030001/CtyunClouddeskUniversal_2.3.0_202030001_x86_20240327104015_Setup.exe"
@@ -86,6 +87,8 @@ class ProxyConfig:
     benchmark_bytes: int = DEFAULT_BENCHMARK_BYTES
     benchmark_timeout: float = DEFAULT_BENCHMARK_TIMEOUT
     benchmark_workers: int = DEFAULT_BENCHMARK_WORKERS
+    benchmark_upload_url: str = ""
+    benchmark_upload_bytes: int = DEFAULT_BENCHMARK_UPLOAD_BYTES
 
 
 def format_authority(host: str, port: int) -> str:
@@ -386,6 +389,49 @@ def benchmark_download(
     raise BenchmarkError("too many download redirects")
 
 
+def benchmark_upload(
+    config: ProxyConfig, endpoint: str, url: str
+) -> Tuple[int, float]:
+    """POST bounded zero-filled chunks and wait for the server response."""
+
+    scheme, host, port, path = benchmark_url_parts(url)
+    sock = benchmark_open_tunnel(config, endpoint, host, port)
+    try:
+        if scheme == "https":
+            context = ssl.create_default_context()
+            sock = context.wrap_socket(sock, server_hostname=host)
+            sock.settimeout(config.benchmark_timeout)
+        default_port = 443 if scheme == "https" else 80
+        host_header = host if port == default_port else format_authority(host, port)
+        total = config.benchmark_upload_bytes
+        request_head = (
+            f"POST {path} HTTP/1.1\r\n"
+            f"Host: {host_header}\r\n"
+            "User-Agent: baidu-proxy-benchmark/1.0\r\n"
+            "Content-Type: application/octet-stream\r\n"
+            f"Content-Length: {total}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode("ascii")
+        chunk = b"\x00" * (128 * 1024)
+        remaining = total
+        started = time.perf_counter()
+        sock.sendall(request_head)
+        while remaining:
+            part = chunk if remaining >= len(chunk) else chunk[:remaining]
+            sock.sendall(part)
+            remaining -= len(part)
+        header, _ = benchmark_read_headers(sock)
+        status, _ = benchmark_parse_response(header)
+        if not 200 <= status < 300:
+            raise BenchmarkError(f"upload returned HTTP {status}")
+        elapsed = max(time.perf_counter() - started, 0.000001)
+        return total, elapsed
+    except (OSError, ssl.SSLError, UnicodeError, BenchmarkError):
+        raise
+    finally:
+        sock.close()
+
+
 def benchmark_candidate(
     candidate: Tuple[str, str], config: ProxyConfig
 ) -> dict[str, object]:
@@ -429,6 +475,15 @@ def benchmark_candidate(
         result["download_url"] = final_url
     except (BenchmarkError, OSError, ssl.SSLError) as exc:
         errors.append(f"download: {exc}")
+    if config.benchmark_upload_url:
+        try:
+            uploaded, elapsed = benchmark_upload(
+                config, endpoint, config.benchmark_upload_url
+            )
+            result["upload_bytes"] = uploaded
+            result["upload_mbps"] = round(uploaded * 8 / elapsed / 1_000_000, 2)
+        except (BenchmarkError, OSError, ssl.SSLError) as exc:
+            errors.append(f"upload: {exc}")
     return result
 
 
@@ -451,7 +506,8 @@ def run_benchmark(config: ProxyConfig) -> None:
 
     print(
         "ip | region | ip_tcp_ms | baidu_direct_tcp_ms | "
-        "baidu_via_proxy_ms | download_mbps | download_bytes | error"
+        "baidu_via_proxy_ms | download_mbps | upload_mbps | "
+        "download_bytes | upload_bytes | error"
     )
     for result in results:
         errors = result["errors"]
@@ -462,7 +518,9 @@ def run_benchmark(config: ProxyConfig) -> None:
             f"{format_benchmark_value(result.get('baidu_direct_tcp_ms'), ' ms')} | "
             f"{format_benchmark_value(result.get('baidu_via_proxy_ms'), ' ms')} | "
             f"{format_benchmark_value(result.get('download_mbps'), ' Mbps')} | "
+            f"{format_benchmark_value(result.get('upload_mbps'), ' Mbps')} | "
             f"{format_benchmark_value(result.get('download_bytes'))} | "
+            f"{format_benchmark_value(result.get('upload_bytes'))} | "
             f"{'; '.join(errors) if errors else 'OK'}"
         )
 
@@ -786,6 +844,17 @@ def parse_args() -> ProxyConfig:
         default=DEFAULT_BENCHMARK_WORKERS,
         help="maximum number of IP benchmarks to run concurrently",
     )
+    parser.add_argument(
+        "--benchmark-upload-url",
+        default="",
+        help="optional HTTP/HTTPS POST endpoint for upload testing; disabled by default",
+    )
+    parser.add_argument(
+        "--benchmark-upload-bytes",
+        type=int,
+        default=DEFAULT_BENCHMARK_UPLOAD_BYTES,
+        help="bytes to send for each upload test",
+    )
     args = parser.parse_args()
     for endpoint in args.upstream_ips:
         try:
@@ -798,6 +867,13 @@ def parse_args() -> ProxyConfig:
         parser.error("--benchmark-timeout must be positive")
     if args.benchmark_workers < 1:
         parser.error("--benchmark-workers must be positive")
+    if args.benchmark_upload_bytes < 1:
+        parser.error("--benchmark-upload-bytes must be positive")
+    if args.benchmark_upload_url:
+        try:
+            benchmark_url_parts(args.benchmark_upload_url)
+        except BenchmarkError as exc:
+            parser.error(str(exc))
     args.upstream_ips = tuple(args.upstream_ips)
     return ProxyConfig(**vars(args))
 

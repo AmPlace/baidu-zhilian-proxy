@@ -83,6 +83,23 @@ Use `--benchmark-url URL` to replace the download target, and
 `--benchmark-timeout SECONDS` to bound each connection, tunnel, or read
 operation. The result table is printed to stdout only.
 
+Upload testing is opt-in because the download URL cannot accept an upload.
+Pass an HTTP/HTTPS endpoint that accepts `POST` data, for example Cloudflare's
+speed-test upload endpoint:
+
+```sh
+python3 baidu_proxy.py \
+  --benchmark \
+  --upstream-ip 180.101.50.208 \
+  --benchmark-upload-url https://speed.cloudflare.com/__up \
+  --benchmark-upload-bytes 8388608
+```
+
+The program sends zero-filled chunks through the selected cloudnproxy IP,
+waits for the upload endpoint's response, calculates `upload_mbps`, and then
+discards everything. It does not use the installer download URL for uploads;
+that URL is a GET-only resource and would not provide a valid upload speed.
+
 To expose only one local protocol, use `--protocol http` or `--protocol
 socks5`. Keep the listener bound to `127.0.0.1`; binding to `0.0.0.0` creates an
 unauthenticated open proxy unless it is protected separately.
