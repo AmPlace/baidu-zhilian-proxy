@@ -89,6 +89,7 @@ class ProxyConfig:
     benchmark_workers: int = DEFAULT_BENCHMARK_WORKERS
     benchmark_upload_url: str = ""
     benchmark_upload_bytes: int = DEFAULT_BENCHMARK_UPLOAD_BYTES
+    benchmark_upload_method: str = "PUT"
 
 
 def format_authority(host: str, port: int) -> str:
@@ -404,22 +405,41 @@ def benchmark_upload(
         default_port = 443 if scheme == "https" else 80
         host_header = host if port == default_port else format_authority(host, port)
         total = config.benchmark_upload_bytes
+        method = config.benchmark_upload_method
         request_head = (
-            f"POST {path} HTTP/1.1\r\n"
+            f"{method} {path} HTTP/1.1\r\n"
             f"Host: {host_header}\r\n"
             "User-Agent: baidu-proxy-benchmark/1.0\r\n"
-            "Content-Type: application/octet-stream\r\n"
-            f"Content-Length: {total}\r\n"
-            "Connection: close\r\n\r\n"
-        ).encode("ascii")
+            "Accept-Encoding: identity\r\n"
+        )
+        if method == "PUT":
+            request_head += (
+                "Content-Type: application/octet-stream\r\n"
+                "Transfer-Encoding: chunked\r\n"
+                "Upload-Draft-Interop-Version: 6\r\n"
+                "Upload-Complete: ?1\r\n"
+            )
+        else:
+            request_head += (
+                "Content-Type: application/octet-stream\r\n"
+                f"Content-Length: {total}\r\n"
+            )
+        request_head = (request_head + "Connection: close\r\n\r\n").encode("ascii")
         chunk = b"\x00" * (128 * 1024)
         remaining = total
         started = time.perf_counter()
         sock.sendall(request_head)
         while remaining:
             part = chunk if remaining >= len(chunk) else chunk[:remaining]
-            sock.sendall(part)
+            if method == "PUT":
+                sock.sendall(f"{len(part):x}\r\n".encode("ascii"))
+                sock.sendall(part)
+                sock.sendall(b"\r\n")
+            else:
+                sock.sendall(part)
             remaining -= len(part)
+        if method == "PUT":
+            sock.sendall(b"0\r\n\r\n")
         header, _ = benchmark_read_headers(sock)
         status, _ = benchmark_parse_response(header)
         if not 200 <= status < 300:
@@ -847,13 +867,19 @@ def parse_args() -> ProxyConfig:
     parser.add_argument(
         "--benchmark-upload-url",
         default="",
-        help="optional HTTP/HTTPS POST endpoint for upload testing; disabled by default",
+        help="optional HTTP/HTTPS upload endpoint; disabled by default",
     )
     parser.add_argument(
         "--benchmark-upload-bytes",
         type=int,
         default=DEFAULT_BENCHMARK_UPLOAD_BYTES,
         help="bytes to send for each upload test",
+    )
+    parser.add_argument(
+        "--benchmark-upload-method",
+        choices=("PUT", "POST"),
+        default="PUT",
+        help="HTTP method for the upload endpoint (iNetSpeed Apple endpoint uses PUT)",
     )
     args = parser.parse_args()
     for endpoint in args.upstream_ips:
