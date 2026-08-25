@@ -1,7 +1,9 @@
 import asyncio
+import sys
 import unittest
+from unittest.mock import patch
 
-from baidu_proxy import ProxyConfig, ProxyServer
+from baidu_proxy import DEFAULT_X_T5_AUTH, ProxyConfig, ProxyServer, parse_args
 
 
 class FakeUpstream:
@@ -41,6 +43,11 @@ class FakeUpstream:
 
 
 class ProxyTests(unittest.IsolatedAsyncioTestCase):
+    def test_cli_uses_builtin_auth_value(self):
+        with patch.object(sys, "argv", ["baidu_proxy.py"]):
+            config = parse_args()
+        self.assertEqual(config.x_t5_auth, DEFAULT_X_T5_AUTH)
+
     async def asyncSetUp(self):
         self.upstream = FakeUpstream()
         upstream_port = await self.upstream.start()

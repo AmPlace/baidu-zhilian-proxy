@@ -12,12 +12,13 @@ requires TLS.
 
 ## Run
 
-Set the value from the Lua script in the environment so it is not stored in the
-command history:
+The `X-T5-Auth` value from the supplied Lua script is built into the program.
+No environment variable is required. You can still override it when needed:
 
 ```sh
-export BAIDU_X_T5_AUTH='value-from-your-lua-script'
 python3 baidu_proxy.py --listen-host 127.0.0.1 --listen-port 26970
+# optional override
+BAIDU_X_T5_AUTH='replacement-value' python3 baidu_proxy.py --listen-port 26970
 ```
 
 The local port auto-detects both protocols:

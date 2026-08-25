@@ -23,6 +23,8 @@ LOG = logging.getLogger("baidu-proxy")
 DEFAULT_UPSTREAM_HOST = "cloudnproxy.baidu.com"
 DEFAULT_UPSTREAM_PORT = 443
 DEFAULT_LISTEN_PORT = 26970
+# Matches the X-T5-Auth value from the supplied Lua backend.
+DEFAULT_X_T5_AUTH = "1951164069"
 DEFAULT_USER_AGENT = (
     "okhttp/3.11.0 SP-engine/2.71.0 "
     "Dalvik/2.1.0 (Linux; U; Android 9; HMA-AL00 Build/PQ3B.190801.002) "
@@ -462,8 +464,8 @@ def parse_args() -> ProxyConfig:
     )
     parser.add_argument(
         "--x-t5-auth",
-        default=os.environ.get("BAIDU_X_T5_AUTH", ""),
-        help="X-T5-Auth value; may also be supplied as BAIDU_X_T5_AUTH",
+        default=os.environ.get("BAIDU_X_T5_AUTH", DEFAULT_X_T5_AUTH),
+        help="X-T5-Auth value; overrides the built-in Lua value",
     )
     parser.add_argument("--connect-timeout", type=float, default=15.0)
     parser.add_argument(
@@ -472,8 +474,6 @@ def parse_args() -> ProxyConfig:
         help="wrap the TCP connection to the upstream in TLS (off by default to match the Lua script)",
     )
     args = parser.parse_args()
-    if not args.x_t5_auth:
-        parser.error("--x-t5-auth or BAIDU_X_T5_AUTH is required")
     for endpoint in args.upstream_ips:
         try:
             ipaddress.ip_address(endpoint)
