@@ -16,6 +16,7 @@ from baidu_proxy import (
     benchmark_proxy_display,
     benchmark_socks_address,
     parse_args,
+    print_benchmark_table,
     run_benchmark,
 )
 
@@ -87,6 +88,7 @@ class BenchmarkProxyTests(unittest.TestCase):
         self.assertTrue(config.benchmark_upload_enabled)
         self.assertEqual(config.benchmark_threads, 1)
         self.assertEqual(config.benchmark_proxy, "")
+        self.assertFalse(config.benchmark_details)
         with patch.object(sys, "argv", ["baidu_proxy.py", "--no-benchmark-upload"]):
             config = parse_args()
         self.assertFalse(config.benchmark_upload_enabled)
@@ -180,6 +182,53 @@ class BenchmarkProxyTests(unittest.TestCase):
         )
         self.assertIn("socks5h://127.0.0.1:1080", output.getvalue())
         self.assertNotIn("secret", output.getvalue())
+
+    def test_benchmark_table_hides_raw_failures(self):
+        result = {
+            "ip": "203.0.113.10",
+            "region": "custom",
+            "errors": ["download"],
+            "details": ["download: upstream CONNECT returned HTTP 502"],
+            "download_mbps": 1.2,
+        }
+        output = StringIO()
+        with redirect_stdout(output):
+            print_benchmark_table([result])
+        rendered = output.getvalue()
+        self.assertIn("失败", rendered)
+        self.assertIn("汇总：成功 0，失败 1", rendered)
+        self.assertNotIn("502", rendered)
+
+    def test_partial_transfer_is_still_a_successful_result(self):
+        result = {
+            "ip": "203.0.113.10",
+            "region": "custom",
+            "errors": ["download"],
+            "details": ["download: 1/4 connections failed"],
+            "baidu_via_proxy_ms": 400.0,
+            "download_mbps": 8.0,
+            "download_bytes": 1048576,
+        }
+        output = StringIO()
+        with redirect_stdout(output):
+            print_benchmark_table([result])
+        self.assertIn("成功", output.getvalue())
+        self.assertIn("汇总：成功 1，失败 0", output.getvalue())
+
+    def test_benchmark_details_are_opt_in(self):
+        config = ProxyConfig(benchmark=True, benchmark_details=True)
+        result = {
+            "ip": "203.0.113.10",
+            "region": "custom",
+            "errors": ["download"],
+            "details": ["download: upstream CONNECT returned HTTP 502"],
+        }
+        output = StringIO()
+        with patch("baidu_proxy.benchmark_candidate", return_value=result):
+            with redirect_stdout(output):
+                run_benchmark(config)
+        self.assertIn("失败详情:", output.getvalue())
+        self.assertIn("HTTP 502", output.getvalue())
 
 
 class ProxyTests(unittest.IsolatedAsyncioTestCase):

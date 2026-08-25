@@ -81,7 +81,15 @@ python3 baidu_proxy.py \
 
 Use `--benchmark-url URL` to replace the download target, and
 `--benchmark-timeout SECONDS` to bound each connection, tunnel, or read
-operation. The result table is printed to stdout only.
+operation. The result table is printed to stdout only. By default each row
+shows only `成功` or `失败`; individual HTTP 502/503/522 responses are not
+printed. Add `--benchmark-details` when diagnosing a failed run.
+
+The table reports the TCP latency, direct Baidu latency, proxy connection
+latency, download speed, upload speed, and an overall result. A multi-thread
+row is marked `成功` when the proxy connection succeeds and at least one
+direction transfers bytes. A few failed parallel connections do not hide a
+valid speed result; use `--benchmark-details` to inspect those partial failures.
 
 Use `--benchmark-threads N` for N simultaneous transfer connections per IP.
 This is separate from `--benchmark-workers`, which controls how many different
@@ -121,6 +129,10 @@ In this mode, `ip_tcp_ms` is the TCP latency to the external proxy listener,
 `baidu_direct_tcp_ms` remains a direct connection from the benchmark host, and
 `baidu_via_proxy_ms` is the full connection through that external proxy.
 `--upstream-ip` is ignored when `--benchmark-proxy` is set.
+The no-`--benchmark-proxy` mode tests the literal built-in BGP IP list; those
+rows are already IP addresses and therefore do not use DNS. Use the
+`socks5h://` mode when the proxy itself must resolve a hostname such as
+`cloudnproxy.baidu.com`.
 
 The benchmark uses the Apple CDN upload endpoint from iNetSpeed-CLI by default;
 the download URL itself cannot accept an upload:

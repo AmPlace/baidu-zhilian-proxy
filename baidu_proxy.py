@@ -18,6 +18,7 @@ import re
 import socket
 import ssl
 import time
+import unicodedata
 from dataclasses import dataclass
 from typing import Optional, Tuple
 from urllib.parse import unquote, urljoin, urlsplit
@@ -96,6 +97,7 @@ class ProxyConfig:
     benchmark_upload_bytes: int = DEFAULT_BENCHMARK_UPLOAD_BYTES
     benchmark_upload_method: str = "PUT"
     benchmark_upload_enabled: bool = True
+    benchmark_details: bool = False
 
 
 def format_authority(host: str, port: int) -> str:
@@ -624,8 +626,6 @@ def benchmark_parallel_download(
                 total += downloaded
             except (BenchmarkError, OSError, ssl.SSLError) as exc:
                 errors.append(str(exc))
-    if total == 0 and errors:
-        raise BenchmarkError("; ".join(errors))
     return total, max(time.perf_counter() - started, 0.000001), errors
 
 
@@ -646,8 +646,6 @@ def benchmark_parallel_upload(
                 total += uploaded
             except (BenchmarkError, OSError, ssl.SSLError) as exc:
                 errors.append(str(exc))
-    if total == 0 and errors:
-        raise BenchmarkError("; ".join(errors))
     return total, max(time.perf_counter() - started, 0.000001), errors
 
 
@@ -655,9 +653,16 @@ def benchmark_candidate(
     candidate: Tuple[str, str], config: ProxyConfig
 ) -> dict[str, object]:
     endpoint, region = candidate
-    result: dict[str, object] = {"ip": endpoint, "region": region, "errors": []}
+    result: dict[str, object] = {
+        "ip": endpoint,
+        "region": region,
+        "errors": [],
+        "details": [],
+    }
     errors = result["errors"]
+    details = result["details"]
     assert isinstance(errors, list)
+    assert isinstance(details, list)
 
     measurements = (
         (
@@ -692,25 +697,40 @@ def benchmark_candidate(
         try:
             result[name] = measure()
         except (BenchmarkError, OSError) as exc:
-            errors.append(f"{name}: {exc}")
+            errors.append(name)
+            details.append(f"{name}: {exc}")
 
     try:
         downloaded, elapsed, transfer_errors = benchmark_parallel_download(
             config, endpoint
         )
-        result["download_bytes"] = downloaded
-        result["download_mbps"] = round(downloaded * 8 / elapsed / 1_000_000, 2)
-        errors.extend(f"download thread: {exc}" for exc in transfer_errors)
+        if downloaded:
+            result["download_bytes"] = downloaded
+            result["download_mbps"] = round(downloaded * 8 / elapsed / 1_000_000, 2)
+        if transfer_errors:
+            errors.append("download")
+            details.append(
+                f"download: {len(transfer_errors)}/{config.benchmark_threads} "
+                f"connections failed; first error: {transfer_errors[0]}"
+            )
     except (BenchmarkError, OSError, ssl.SSLError) as exc:
-        errors.append(f"download: {exc}")
+        errors.append("download")
+        details.append(f"download: {exc}")
     if config.benchmark_upload_enabled and config.benchmark_upload_url:
         try:
             uploaded, elapsed, transfer_errors = benchmark_parallel_upload(config, endpoint)
-            result["upload_bytes"] = uploaded
-            result["upload_mbps"] = round(uploaded * 8 / elapsed / 1_000_000, 2)
-            errors.extend(f"upload thread: {exc}" for exc in transfer_errors)
+            if uploaded:
+                result["upload_bytes"] = uploaded
+                result["upload_mbps"] = round(uploaded * 8 / elapsed / 1_000_000, 2)
+            if transfer_errors:
+                errors.append("upload")
+                details.append(
+                    f"upload: {len(transfer_errors)}/{config.benchmark_threads} "
+                    f"connections failed; first error: {transfer_errors[0]}"
+                )
         except (BenchmarkError, OSError, ssl.SSLError) as exc:
-            errors.append(f"upload: {exc}")
+            errors.append("upload")
+            details.append(f"upload: {exc}")
     return result
 
 
@@ -720,6 +740,56 @@ def format_benchmark_value(value: object, suffix: str = "") -> str:
     if isinstance(value, float):
         return f"{value:.1f}{suffix}"
     return f"{value}{suffix}"
+
+
+def benchmark_display_width(value: str) -> int:
+    return sum(
+        2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+        for char in value
+    )
+
+
+def benchmark_pad(value: str, width: int) -> str:
+    return value + " " * max(0, width - benchmark_display_width(value))
+
+
+def benchmark_result_success(result: dict[str, object]) -> bool:
+    if result.get("baidu_via_proxy_ms") is None:
+        return False
+    return any(
+        isinstance(result.get(key), int) and result[key] > 0
+        for key in ("download_bytes", "upload_bytes")
+    )
+
+
+def print_benchmark_table(results: list[dict[str, object]]) -> None:
+    headers = ("IP/代理", "地区", "IP TCP", "百度直连", "百度代理", "下载", "上传", "结果")
+    rows = []
+    for result in results:
+        errors = result["errors"]
+        assert isinstance(errors, list)
+        rows.append(
+            (
+                str(result["ip"]),
+                str(result["region"]),
+                format_benchmark_value(result.get("ip_tcp_ms"), " ms"),
+                format_benchmark_value(result.get("baidu_direct_tcp_ms"), " ms"),
+                format_benchmark_value(result.get("baidu_via_proxy_ms"), " ms"),
+                format_benchmark_value(result.get("download_mbps"), " Mbps"),
+                format_benchmark_value(result.get("upload_mbps"), " Mbps"),
+                "成功" if benchmark_result_success(result) else "失败",
+            )
+        )
+    widths = [
+        max(benchmark_display_width(row[index]) for row in (headers, *rows))
+        for index in range(len(headers))
+    ]
+    print(" | ".join(benchmark_pad(value, widths[index]) for index, value in enumerate(headers)))
+    print("-+-".join("-" * width for width in widths))
+    for row in rows:
+        print(" | ".join(benchmark_pad(value, widths[index]) for index, value in enumerate(row)))
+    success_count = sum(1 for row in rows if row[-1] == "成功")
+    print(f"\n汇总：成功 {success_count}，失败 {len(rows) - success_count}")
 
 
 def run_benchmark(config: ProxyConfig) -> None:
@@ -733,25 +803,18 @@ def run_benchmark(config: ProxyConfig) -> None:
     with ThreadPoolExecutor(max_workers=workers) as executor:
         results = list(executor.map(lambda item: benchmark_candidate(item, config), candidates))
 
-    print(
-        "ip | region | ip_tcp_ms | baidu_direct_tcp_ms | "
-        "baidu_via_proxy_ms | download_mbps | upload_mbps | "
-        "download_bytes | upload_bytes | error"
-    )
-    for result in results:
-        errors = result["errors"]
-        assert isinstance(errors, list)
-        print(
-            f"{result['ip']} | {result['region']} | "
-            f"{format_benchmark_value(result.get('ip_tcp_ms'), ' ms')} | "
-            f"{format_benchmark_value(result.get('baidu_direct_tcp_ms'), ' ms')} | "
-            f"{format_benchmark_value(result.get('baidu_via_proxy_ms'), ' ms')} | "
-            f"{format_benchmark_value(result.get('download_mbps'), ' Mbps')} | "
-            f"{format_benchmark_value(result.get('upload_mbps'), ' Mbps')} | "
-            f"{format_benchmark_value(result.get('download_bytes'))} | "
-            f"{format_benchmark_value(result.get('upload_bytes'))} | "
-            f"{'; '.join(errors) if errors else 'OK'}"
-        )
+    print_benchmark_table(results)
+    if config.benchmark_details:
+        details = [
+            (str(result["ip"]), result.get("details", []))
+            for result in results
+            if result.get("details")
+        ]
+        if details:
+            print("\n失败详情:")
+            for endpoint, endpoint_details in details:
+                assert isinstance(endpoint_details, list)
+                print(f"{endpoint}: {'; '.join(str(detail) for detail in endpoint_details)}")
 
 
 async def relay(
@@ -1107,6 +1170,11 @@ def parse_args() -> ProxyConfig:
         dest="benchmark_upload_enabled",
         action="store_false",
         help="skip the upload test while running --benchmark",
+    )
+    parser.add_argument(
+        "--benchmark-details",
+        action="store_true",
+        help="print compact failure details after the benchmark table",
     )
     args = parser.parse_args()
     for endpoint in args.upstream_ips:
