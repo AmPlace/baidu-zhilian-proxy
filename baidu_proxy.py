@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 from concurrent.futures import ThreadPoolExecutor
 import ipaddress
 import logging
@@ -19,7 +20,7 @@ import ssl
 import time
 from dataclasses import dataclass
 from typing import Optional, Tuple
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit
 
 
 LOG = logging.getLogger("baidu-proxy")
@@ -81,6 +82,7 @@ class ProxyConfig:
     upstream_host: str = DEFAULT_UPSTREAM_HOST
     upstream_port: int = DEFAULT_UPSTREAM_PORT
     upstream_ips: Tuple[str, ...] = ()
+    benchmark_proxy: str = ""
     x_t5_auth: str = ""
     connect_timeout: float = 15.0
     upstream_tls: bool = False
@@ -261,6 +263,148 @@ def benchmark_parse_response(header: bytes) -> Tuple[int, dict[str, str]]:
     return int(match.group(1)), headers
 
 
+def benchmark_proxy_parts(raw_proxy: str) -> Tuple[str, str, int, str, str]:
+    try:
+        parsed = urlsplit(raw_proxy)
+        scheme = parsed.scheme.lower()
+        if scheme not in {"http", "socks5", "socks5h"}:
+            raise ValueError("proxy must use http, socks5, or socks5h")
+        if not parsed.hostname:
+            raise ValueError("proxy URL has no host")
+        default_port = 1080 if scheme.startswith("socks5") else 8080
+        port = parsed.port or default_port
+        if not 1 <= port <= 65535:
+            raise ValueError("proxy port is out of range")
+        username = unquote(parsed.username or "")
+        password = unquote(parsed.password or "")
+        return scheme, parsed.hostname, port, username, password
+    except ValueError as exc:
+        raise BenchmarkError(f"invalid benchmark proxy: {exc}") from exc
+
+
+def benchmark_proxy_display(raw_proxy: str) -> str:
+    scheme, host, port, _, _ = benchmark_proxy_parts(raw_proxy)
+    return f"{scheme}://{format_authority(host, port)}"
+
+
+def benchmark_recv_exact(sock: socket.socket, size: int) -> bytes:
+    data = bytearray()
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise BenchmarkError("proxy closed during handshake")
+        data.extend(chunk)
+    return bytes(data)
+
+
+def benchmark_socks_address(host: str, port: int, remote_dns: bool = True) -> bytes:
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        if remote_dns:
+            encoded = host.encode("idna")
+            if not 1 <= len(encoded) <= 255:
+                raise BenchmarkError("SOCKS5 target hostname is too long")
+            return b"\x03" + bytes([len(encoded)]) + encoded + port.to_bytes(2, "big")
+        try:
+            addresses = socket.getaddrinfo(
+                host.encode("idna").decode("ascii"),
+                port,
+                type=socket.SOCK_STREAM,
+            )
+        except (OSError, UnicodeError) as exc:
+            raise BenchmarkError(f"local DNS lookup failed: {exc}") from exc
+        for family, _, _, _, sockaddr in addresses:
+            if family in {socket.AF_INET, socket.AF_INET6}:
+                address = ipaddress.ip_address(sockaddr[0])
+                address_type = 1 if address.version == 4 else 4
+                return bytes([address_type]) + address.packed + port.to_bytes(2, "big")
+        raise BenchmarkError("local DNS lookup returned no IPv4/IPv6 address")
+    address_type = 1 if address.version == 4 else 4
+    return bytes([address_type]) + address.packed + port.to_bytes(2, "big")
+
+
+def benchmark_open_external_tunnel(
+    config: ProxyConfig, target_host: str, target_port: int
+) -> socket.socket:
+    scheme, proxy_host, proxy_port, username, password = benchmark_proxy_parts(
+        config.benchmark_proxy
+    )
+    try:
+        sock = socket.create_connection(
+            (proxy_host, proxy_port), timeout=config.benchmark_timeout
+        )
+        sock.settimeout(config.benchmark_timeout)
+    except OSError as exc:
+        raise BenchmarkError(f"cannot connect to benchmark proxy: {exc}") from exc
+
+    try:
+        if scheme == "http":
+            request = (
+                f"CONNECT {format_authority(target_host, target_port)} HTTP/1.1\r\n"
+                f"Host: {format_authority(target_host, target_port)}\r\n"
+                "Proxy-Connection: Keep-Alive\r\n"
+            )
+            if username or password:
+                credentials = base64.b64encode(
+                    f"{username}:{password}".encode("utf-8")
+                ).decode("ascii")
+                request += f"Proxy-Authorization: Basic {credentials}\r\n"
+            sock.sendall((request + "\r\n").encode("ascii"))
+            header, _ = benchmark_read_headers(sock)
+            status, _ = benchmark_parse_response(header)
+            if not 200 <= status < 300:
+                raise BenchmarkError(f"HTTP proxy CONNECT returned HTTP {status}")
+            return sock
+
+        methods = b"\x00"
+        if username or password:
+            methods = b"\x02\x00"
+        sock.sendall(b"\x05" + bytes([len(methods)]) + methods)
+        version, method = benchmark_recv_exact(sock, 2)
+        if version != 5 or method == 0xFF:
+            raise BenchmarkError("SOCKS5 proxy has no compatible authentication method")
+        if method == 0x02:
+            user = username.encode("utf-8")
+            secret = password.encode("utf-8")
+            if len(user) > 255 or len(secret) > 255:
+                raise BenchmarkError("SOCKS5 credentials are too long")
+            sock.sendall(
+                b"\x01"
+                + bytes([len(user)])
+                + user
+                + bytes([len(secret)])
+                + secret
+            )
+            auth_version, auth_status = benchmark_recv_exact(sock, 2)
+            if auth_version != 1 or auth_status != 0:
+                raise BenchmarkError("SOCKS5 username/password authentication failed")
+        elif method != 0x00:
+            raise BenchmarkError(f"SOCKS5 proxy selected unsupported method {method}")
+
+        sock.sendall(
+            b"\x05\x01\x00"
+            + benchmark_socks_address(target_host, target_port, scheme == "socks5h")
+        )
+        version, status, _, address_type = benchmark_recv_exact(sock, 4)
+        if version != 5 or status != 0:
+            raise BenchmarkError(f"SOCKS5 CONNECT failed with code {status}")
+        if address_type == 1:
+            benchmark_recv_exact(sock, 4)
+        elif address_type == 3:
+            length = benchmark_recv_exact(sock, 1)[0]
+            benchmark_recv_exact(sock, length)
+        elif address_type == 4:
+            benchmark_recv_exact(sock, 16)
+        else:
+            raise BenchmarkError("SOCKS5 proxy returned an invalid address type")
+        benchmark_recv_exact(sock, 2)
+        return sock
+    except (OSError, UnicodeError, ssl.SSLError, BenchmarkError):
+        sock.close()
+        raise
+
+
 def benchmark_open_upstream(config: ProxyConfig, endpoint: str) -> socket.socket:
     try:
         sock = socket.create_connection(
@@ -283,6 +427,8 @@ def benchmark_open_upstream(config: ProxyConfig, endpoint: str) -> socket.socket
 def benchmark_open_tunnel(
     config: ProxyConfig, endpoint: str, target_host: str, target_port: int
 ) -> socket.socket:
+    if config.benchmark_proxy:
+        return benchmark_open_external_tunnel(config, target_host, target_port)
     sock = benchmark_open_upstream(config, endpoint)
     request = (
         f"CONNECT {format_authority(target_host, target_port)} HTTP/1.1\r\n"
@@ -321,6 +467,11 @@ def benchmark_proxy_tcping(
     sock = benchmark_open_tunnel(config, endpoint, target_host, target_port)
     sock.close()
     return round((time.perf_counter() - started) * 1000, 1)
+
+
+def benchmark_external_proxy_tcping(config: ProxyConfig) -> float:
+    _, host, port, _, _ = benchmark_proxy_parts(config.benchmark_proxy)
+    return benchmark_tcping(host, port, config.benchmark_timeout)
 
 
 def benchmark_url_parts(url: str) -> Tuple[str, str, int, str]:
@@ -509,7 +660,16 @@ def benchmark_candidate(
     assert isinstance(errors, list)
 
     measurements = (
-        ("ip_tcp_ms", lambda: benchmark_tcping(endpoint, config.upstream_port, config.benchmark_timeout)),
+        (
+            "ip_tcp_ms",
+            (
+                (lambda: benchmark_external_proxy_tcping(config))
+                if config.benchmark_proxy
+                else lambda: benchmark_tcping(
+                    endpoint, config.upstream_port, config.benchmark_timeout
+                )
+            ),
+        ),
         (
             "baidu_direct_tcp_ms",
             lambda: benchmark_tcping(
@@ -563,7 +723,9 @@ def format_benchmark_value(value: object, suffix: str = "") -> str:
 
 
 def run_benchmark(config: ProxyConfig) -> None:
-    if config.upstream_ips:
+    if config.benchmark_proxy:
+        candidates = [("custom-proxy", benchmark_proxy_display(config.benchmark_proxy))]
+    elif config.upstream_ips:
         candidates = [(endpoint, "custom") for endpoint in config.upstream_ips]
     else:
         candidates = list(BUILTIN_UPSTREAM_IPS)
@@ -873,6 +1035,12 @@ def parse_args() -> ProxyConfig:
         help="connect to this cloudnproxy IP instead of DNS; repeat for ordered failover",
     )
     parser.add_argument(
+        "--benchmark-proxy",
+        default="",
+        metavar="URL",
+        help="benchmark through an external http://, socks5://, or socks5h:// proxy",
+    )
+    parser.add_argument(
         "--x-t5-auth",
         default=os.environ.get("BAIDU_X_T5_AUTH", DEFAULT_X_T5_AUTH),
         help="X-T5-Auth value; overrides the built-in Lua value",
@@ -959,6 +1127,11 @@ def parse_args() -> ProxyConfig:
     if args.benchmark_upload_url:
         try:
             benchmark_url_parts(args.benchmark_upload_url)
+        except BenchmarkError as exc:
+            parser.error(str(exc))
+    if args.benchmark_proxy:
+        try:
+            benchmark_proxy_parts(args.benchmark_proxy)
         except BenchmarkError as exc:
             parser.error(str(exc))
     args.upstream_ips = tuple(args.upstream_ips)

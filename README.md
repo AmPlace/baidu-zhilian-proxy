@@ -101,6 +101,27 @@ The byte limits apply per transfer connection, so four threads can transfer up
 to four times the configured bytes. Keeping `--benchmark-workers 1` makes a
 single-IP multi-thread result easier to compare.
 
+To benchmark through an existing local HTTP or SOCKS5 proxy instead of the
+built-in cloudnproxy path, pass `--benchmark-proxy`. When set, the built-in IP
+list is skipped and one result is produced for that proxy:
+
+```sh
+python3 baidu_proxy.py \
+  --benchmark \
+  --benchmark-proxy socks5h://127.0.0.1:1080 \
+  --benchmark-workers 1 \
+  --benchmark-threads 4
+```
+
+HTTP CONNECT proxies use `http://host:port`; SOCKS5 proxies use
+`socks5://host:port` or `socks5h://host:port`. Optional
+`user:password@` credentials are supported. `socks5` resolves benchmark
+hostnames locally; `socks5h` keeps target DNS at the SOCKS5 proxy.
+In this mode, `ip_tcp_ms` is the TCP latency to the external proxy listener,
+`baidu_direct_tcp_ms` remains a direct connection from the benchmark host, and
+`baidu_via_proxy_ms` is the full connection through that external proxy.
+`--upstream-ip` is ignored when `--benchmark-proxy` is set.
+
 The benchmark uses the Apple CDN upload endpoint from iNetSpeed-CLI by default;
 the download URL itself cannot accept an upload:
 

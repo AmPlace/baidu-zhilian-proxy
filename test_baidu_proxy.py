@@ -1,14 +1,22 @@
 import asyncio
+from contextlib import redirect_stdout
+from io import StringIO
+import socket
 import sys
 import unittest
 from unittest.mock import patch
 
 from baidu_proxy import (
+    BenchmarkError,
     DEFAULT_BENCHMARK_UPLOAD_URL,
     DEFAULT_X_T5_AUTH,
     ProxyConfig,
     ProxyServer,
+    benchmark_open_external_tunnel,
+    benchmark_proxy_display,
+    benchmark_socks_address,
     parse_args,
+    run_benchmark,
 )
 
 
@@ -48,7 +56,29 @@ class FakeUpstream:
             await writer.wait_closed()
 
 
-class ProxyTests(unittest.IsolatedAsyncioTestCase):
+class FakeSocket:
+    def __init__(self, response=b""):
+        self.response = bytearray(response)
+        self.sent = []
+        self.timeout = None
+        self.closed = False
+
+    def settimeout(self, timeout):
+        self.timeout = timeout
+
+    def sendall(self, data):
+        self.sent.append(data)
+
+    def recv(self, size):
+        data = bytes(self.response[:size])
+        del self.response[:size]
+        return data
+
+    def close(self):
+        self.closed = True
+
+
+class BenchmarkProxyTests(unittest.TestCase):
     def test_cli_uses_builtin_auth_value(self):
         with patch.object(sys, "argv", ["baidu_proxy.py"]):
             config = parse_args()
@@ -56,10 +86,103 @@ class ProxyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config.benchmark_upload_url, DEFAULT_BENCHMARK_UPLOAD_URL)
         self.assertTrue(config.benchmark_upload_enabled)
         self.assertEqual(config.benchmark_threads, 1)
+        self.assertEqual(config.benchmark_proxy, "")
         with patch.object(sys, "argv", ["baidu_proxy.py", "--no-benchmark-upload"]):
             config = parse_args()
         self.assertFalse(config.benchmark_upload_enabled)
+        with patch.object(
+            sys,
+            "argv",
+            ["baidu_proxy.py", "--benchmark-proxy", "socks5h://user:pass@127.0.0.1:1080"],
+        ):
+            config = parse_args()
+        self.assertEqual(config.benchmark_proxy, "socks5h://user:pass@127.0.0.1:1080")
 
+    def test_benchmark_proxy_display_hides_credentials(self):
+        self.assertEqual(
+            benchmark_proxy_display("http://user:secret@127.0.0.1:8080"),
+            "http://127.0.0.1:8080",
+        )
+
+    def test_socks5h_uses_proxy_dns(self):
+        address = benchmark_socks_address("www.baidu.com", 443, remote_dns=True)
+        self.assertEqual(address[:2], b"\x03\x0d")
+        self.assertEqual(address[2:-2], b"www.baidu.com")
+
+    def test_socks5_uses_local_dns(self):
+        with patch(
+            "baidu_proxy.socket.getaddrinfo",
+            return_value=[
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", 443))
+            ],
+        ):
+            address = benchmark_socks_address("www.baidu.com", 443, remote_dns=False)
+        self.assertEqual(address, b"\x01\xc0\x00\x02\x01\x01\xbb")
+
+    def test_http_external_proxy_connect(self):
+        fake = FakeSocket(b"HTTP/1.1 200 Connection established\r\n\r\n")
+        config = ProxyConfig(benchmark_proxy="http://user:secret@127.0.0.1:8080")
+        with patch("baidu_proxy.socket.create_connection", return_value=fake):
+            self.assertIs(
+                benchmark_open_external_tunnel(config, "www.baidu.com", 443), fake
+            )
+        request = b"".join(fake.sent)
+        self.assertIn(b"CONNECT www.baidu.com:443 HTTP/1.1", request)
+        self.assertIn(b"Proxy-Authorization: Basic dXNlcjpzZWNyZXQ=", request)
+        self.assertFalse(fake.closed)
+
+    def test_socks5h_external_proxy_connect(self):
+        response = b"\x05\x00\x05\x00\x00\x01\x7f\x00\x00\x01\x1a\xe1"
+        fake = FakeSocket(response)
+        config = ProxyConfig(benchmark_proxy="socks5h://127.0.0.1:1080")
+        with patch("baidu_proxy.socket.create_connection", return_value=fake):
+            self.assertIs(
+                benchmark_open_external_tunnel(config, "www.baidu.com", 443), fake
+            )
+        self.assertEqual(fake.sent[0], b"\x05\x01\x00")
+        self.assertEqual(
+            fake.sent[1], b"\x05\x01\x00\x03\x0dwww.baidu.com\x01\xbb"
+        )
+        self.assertFalse(fake.closed)
+
+    def test_invalid_benchmark_proxy_is_rejected(self):
+        with patch.object(
+            sys, "argv", ["baidu_proxy.py", "--benchmark-proxy", "ftp://127.0.0.1:21"]
+        ):
+            with self.assertRaises(SystemExit):
+                parse_args()
+
+    def test_external_proxy_handshake_failure_closes_socket(self):
+        fake = FakeSocket(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
+        config = ProxyConfig(benchmark_proxy="http://127.0.0.1:8080")
+        with patch("baidu_proxy.socket.create_connection", return_value=fake):
+            with self.assertRaises(BenchmarkError):
+                benchmark_open_external_tunnel(config, "www.baidu.com", 443)
+        self.assertTrue(fake.closed)
+
+
+    def test_benchmark_proxy_skips_builtin_candidates(self):
+        config = ProxyConfig(
+            benchmark=True,
+            benchmark_proxy="socks5h://user:secret@127.0.0.1:1080",
+        )
+        result = {
+            "ip": "custom-proxy",
+            "region": "socks5h://127.0.0.1:1080",
+            "errors": [],
+        }
+        output = StringIO()
+        with patch("baidu_proxy.benchmark_candidate", return_value=result) as candidate:
+            with redirect_stdout(output):
+                run_benchmark(config)
+        candidate.assert_called_once_with(
+            ("custom-proxy", "socks5h://127.0.0.1:1080"), config
+        )
+        self.assertIn("socks5h://127.0.0.1:1080", output.getvalue())
+        self.assertNotIn("secret", output.getvalue())
+
+
+class ProxyTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.upstream = FakeUpstream()
         upstream_port = await self.upstream.start()
