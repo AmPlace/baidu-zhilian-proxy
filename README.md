@@ -52,6 +52,37 @@ The IP is only used for the TCP connection. The logical upstream hostname and
 the Lua-compatible CONNECT headers remain unchanged. IPv4 and IPv6 addresses
 are accepted.
 
+## Benchmark
+
+Run the built-in concurrent link benchmark:
+
+```sh
+python3 baidu_proxy.py --benchmark
+```
+
+For each built-in IP it reports:
+
+- TCP connect latency to the IP on port 443;
+- direct TCP connect latency to `www.baidu.com:443`;
+- latency to establish `www.baidu.com:443` through that cloudnproxy IP;
+- download throughput through that cloudnproxy IP using the Ctyun URL.
+
+The download test reads at most 2 MiB by default and discards the bytes in
+memory. It does not create a download file. Tests run concurrently; reduce the
+traffic or test only selected IPs like this:
+
+```sh
+python3 baidu_proxy.py \
+  --benchmark \
+  --upstream-ip 36.155.169.188 \
+  --upstream-ip 183.240.98.84 \
+  --benchmark-bytes 1048576
+```
+
+Use `--benchmark-url URL` to replace the download target, and
+`--benchmark-timeout SECONDS` to bound each connection, tunnel, or read
+operation. The result table is printed to stdout only.
+
 To expose only one local protocol, use `--protocol http` or `--protocol
 socks5`. Keep the listener bound to `127.0.0.1`; binding to `0.0.0.0` creates an
 unauthenticated open proxy unless it is protected separately.

@@ -9,14 +9,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import ipaddress
 import logging
 import os
 import re
+import socket
 import ssl
+import time
 from dataclasses import dataclass
 from typing import Optional, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 
 LOG = logging.getLogger("baidu-proxy")
@@ -25,6 +28,31 @@ DEFAULT_UPSTREAM_PORT = 443
 DEFAULT_LISTEN_PORT = 26970
 # Matches the X-T5-Auth value from the supplied Lua backend.
 DEFAULT_X_T5_AUTH = "1951164069"
+DEFAULT_BENCHMARK_TARGET = "www.baidu.com"
+DEFAULT_BENCHMARK_PORT = 443
+DEFAULT_BENCHMARK_BYTES = 2 * 1024 * 1024
+DEFAULT_BENCHMARK_TIMEOUT = 15.0
+DEFAULT_BENCHMARK_WORKERS = 8
+DEFAULT_BENCHMARK_URL = (
+    "https://desk.ctyun.cn:8999/desktop-prod/software/windows_tob_client/15/64/"
+    "202030001/CtyunClouddeskUniversal_2.3.0_202030001_x86_20240327104015_Setup.exe"
+)
+BUILTIN_UPSTREAM_IPS: Tuple[Tuple[str, str], ...] = (
+    ("36.155.169.188", "中国/江苏/南京/移动"),
+    ("183.240.98.84", "中国/广东/广州/移动"),
+    ("14.215.182.75", "中国/广东/广州/电信"),
+    ("110.242.70.69", "中国/河北/保定/联通"),
+    ("153.3.237.117", "中国/江苏/南京/联通"),
+    ("110.242.70.68", "中国/河北/保定/联通"),
+    ("220.181.33.174", "中国/北京/电信"),
+    ("180.101.50.208", "中国/江苏/南京/电信"),
+    ("180.101.50.249", "中国/江苏/南京/电信"),
+    ("163.177.17.6", "中国/广东/广州/联通"),
+    ("157.0.146.158", "中国/江苏/苏州/联通"),
+    ("163.177.17.189", "中国/广东/广州/联通"),
+    ("220.181.111.189", "中国/北京/电信"),
+    ("220.181.7.1", "中国/北京/电信"),
+)
 DEFAULT_USER_AGENT = (
     "okhttp/3.11.0 SP-engine/2.71.0 "
     "Dalvik/2.1.0 (Linux; U; Android 9; HMA-AL00 Build/PQ3B.190801.002) "
@@ -53,6 +81,11 @@ class ProxyConfig:
     x_t5_auth: str = ""
     connect_timeout: float = 15.0
     upstream_tls: bool = False
+    benchmark: bool = False
+    benchmark_url: str = DEFAULT_BENCHMARK_URL
+    benchmark_bytes: int = DEFAULT_BENCHMARK_BYTES
+    benchmark_timeout: float = DEFAULT_BENCHMARK_TIMEOUT
+    benchmark_workers: int = DEFAULT_BENCHMARK_WORKERS
 
 
 def format_authority(host: str, port: int) -> str:
@@ -180,6 +213,258 @@ async def open_upstream(
                     pass
 
     raise UpstreamHandshakeError("all upstream endpoints failed: " + "; ".join(failures))
+
+
+class BenchmarkError(Exception):
+    pass
+
+
+def benchmark_read_headers(sock: socket.socket) -> Tuple[bytes, bytes]:
+    """Read an HTTP header and retain any bytes already received after it."""
+
+    data = bytearray()
+    while len(data) <= MAX_HTTP_HEADER:
+        chunk = sock.recv(8192)
+        if not chunk:
+            raise BenchmarkError("connection closed before HTTP headers")
+        data.extend(chunk)
+        marker = data.find(b"\r\n\r\n")
+        if marker >= 0:
+            end = marker + 4
+            return bytes(data[:end]), bytes(data[end:])
+    raise BenchmarkError("HTTP headers are too large")
+
+
+def benchmark_parse_response(header: bytes) -> Tuple[int, dict[str, str]]:
+    try:
+        lines = header.decode("iso-8859-1").split("\r\n")
+    except UnicodeDecodeError as exc:
+        raise BenchmarkError("invalid HTTP response") from exc
+    match = re.match(r"^HTTP/\d\.\d\s+(\d{3})(?:\s|$)", lines[0] if lines else "")
+    if not match:
+        raise BenchmarkError("invalid HTTP status line")
+    headers: dict[str, str] = {}
+    for line in lines[1:]:
+        if not line:
+            continue
+        if ":" in line:
+            name, value = line.split(":", 1)
+            headers[name.lower()] = value.strip()
+    return int(match.group(1)), headers
+
+
+def benchmark_open_upstream(config: ProxyConfig, endpoint: str) -> socket.socket:
+    try:
+        sock = socket.create_connection(
+            (endpoint, config.upstream_port), timeout=config.benchmark_timeout
+        )
+        sock.settimeout(config.benchmark_timeout)
+        if config.upstream_tls:
+            context = ssl.create_default_context()
+            try:
+                sock = context.wrap_socket(sock, server_hostname=config.upstream_host)
+                sock.settimeout(config.benchmark_timeout)
+            except Exception:
+                sock.close()
+                raise
+        return sock
+    except (OSError, ssl.SSLError) as exc:
+        raise BenchmarkError(f"cannot connect to upstream: {exc}") from exc
+
+
+def benchmark_open_tunnel(
+    config: ProxyConfig, endpoint: str, target_host: str, target_port: int
+) -> socket.socket:
+    sock = benchmark_open_upstream(config, endpoint)
+    request = (
+        f"CONNECT {format_authority(target_host, target_port)} HTTP/1.1\r\n"
+        "Host: ascdn.baidu.com\r\n"
+        "Proxy-Connection: Keep-Alive\r\n"
+        f"X-T5-Auth: {config.x_t5_auth}\r\n"
+        f"User-Agent: {DEFAULT_USER_AGENT}\r\n"
+        "\r\n"
+    ).encode("ascii")
+    try:
+        sock.sendall(request)
+        header, _ = benchmark_read_headers(sock)
+        status, _ = benchmark_parse_response(header)
+        if not 200 <= status < 300:
+            raise BenchmarkError(f"upstream CONNECT returned HTTP {status}")
+        return sock
+    except (OSError, UnicodeError, ssl.SSLError, BenchmarkError):
+        sock.close()
+        raise
+
+
+def benchmark_tcping(host: str, port: int, timeout: float) -> float:
+    started = time.perf_counter()
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            pass
+    except OSError as exc:
+        raise BenchmarkError(str(exc)) from exc
+    return round((time.perf_counter() - started) * 1000, 1)
+
+
+def benchmark_proxy_tcping(
+    config: ProxyConfig, endpoint: str, target_host: str, target_port: int
+) -> float:
+    started = time.perf_counter()
+    sock = benchmark_open_tunnel(config, endpoint, target_host, target_port)
+    sock.close()
+    return round((time.perf_counter() - started) * 1000, 1)
+
+
+def benchmark_url_parts(url: str) -> Tuple[str, str, int, str]:
+    try:
+        parsed = urlsplit(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("URL must use http or https and include a host")
+        default_port = 443 if parsed.scheme == "https" else 80
+        port = parsed.port or default_port
+    except ValueError as exc:
+        raise BenchmarkError(f"invalid download URL: {exc}") from exc
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+    return parsed.scheme, parsed.hostname, port, path
+
+
+def benchmark_download(
+    config: ProxyConfig, endpoint: str, url: str
+) -> Tuple[int, float, str]:
+    """Download and discard a bounded prefix, following a few redirects."""
+
+    current_url = url
+    for _ in range(4):
+        scheme, host, port, path = benchmark_url_parts(current_url)
+        sock = benchmark_open_tunnel(config, endpoint, host, port)
+        try:
+            if scheme == "https":
+                context = ssl.create_default_context()
+                sock = context.wrap_socket(sock, server_hostname=host)
+                sock.settimeout(config.benchmark_timeout)
+            default_port = 443 if scheme == "https" else 80
+            host_header = host if port == default_port else format_authority(host, port)
+            request = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {host_header}\r\n"
+                "User-Agent: baidu-proxy-benchmark/1.0\r\n"
+                "Accept-Encoding: identity\r\n"
+                "Connection: close\r\n\r\n"
+            ).encode("ascii")
+            sock.sendall(request)
+            header, remainder = benchmark_read_headers(sock)
+            status, headers = benchmark_parse_response(header)
+            if status in {301, 302, 303, 307, 308}:
+                location = headers.get("location")
+                if not location:
+                    raise BenchmarkError(f"HTTP {status} without Location")
+                current_url = urljoin(current_url, location)
+                continue
+            if not 200 <= status < 300:
+                raise BenchmarkError(f"download returned HTTP {status}")
+
+            limit = config.benchmark_bytes
+            downloaded = min(len(remainder), limit)
+            started = time.perf_counter() if downloaded else None
+            while downloaded < limit:
+                chunk = sock.recv(min(128 * 1024, limit - downloaded))
+                if not chunk:
+                    break
+                if started is None:
+                    started = time.perf_counter()
+                downloaded += len(chunk)
+            if not downloaded or started is None:
+                raise BenchmarkError("download returned no body")
+            elapsed = max(time.perf_counter() - started, 0.000001)
+            return downloaded, elapsed, current_url
+        except (OSError, ssl.SSLError, UnicodeError, BenchmarkError):
+            raise
+        finally:
+            sock.close()
+    raise BenchmarkError("too many download redirects")
+
+
+def benchmark_candidate(
+    candidate: Tuple[str, str], config: ProxyConfig
+) -> dict[str, object]:
+    endpoint, region = candidate
+    result: dict[str, object] = {"ip": endpoint, "region": region, "errors": []}
+    errors = result["errors"]
+    assert isinstance(errors, list)
+
+    measurements = (
+        ("ip_tcp_ms", lambda: benchmark_tcping(endpoint, config.upstream_port, config.benchmark_timeout)),
+        (
+            "baidu_direct_tcp_ms",
+            lambda: benchmark_tcping(
+                DEFAULT_BENCHMARK_TARGET,
+                DEFAULT_BENCHMARK_PORT,
+                config.benchmark_timeout,
+            ),
+        ),
+        (
+            "baidu_via_proxy_ms",
+            lambda: benchmark_proxy_tcping(
+                config,
+                endpoint,
+                DEFAULT_BENCHMARK_TARGET,
+                DEFAULT_BENCHMARK_PORT,
+            ),
+        ),
+    )
+    for name, measure in measurements:
+        try:
+            result[name] = measure()
+        except (BenchmarkError, OSError) as exc:
+            errors.append(f"{name}: {exc}")
+
+    try:
+        downloaded, elapsed, final_url = benchmark_download(
+            config, endpoint, config.benchmark_url
+        )
+        result["download_bytes"] = downloaded
+        result["download_mbps"] = round(downloaded * 8 / elapsed / 1_000_000, 2)
+        result["download_url"] = final_url
+    except (BenchmarkError, OSError, ssl.SSLError) as exc:
+        errors.append(f"download: {exc}")
+    return result
+
+
+def format_benchmark_value(value: object, suffix: str = "") -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, float):
+        return f"{value:.1f}{suffix}"
+    return f"{value}{suffix}"
+
+
+def run_benchmark(config: ProxyConfig) -> None:
+    if config.upstream_ips:
+        candidates = [(endpoint, "custom") for endpoint in config.upstream_ips]
+    else:
+        candidates = list(BUILTIN_UPSTREAM_IPS)
+    workers = max(1, min(config.benchmark_workers, len(candidates)))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        results = list(executor.map(lambda item: benchmark_candidate(item, config), candidates))
+
+    print(
+        "ip | region | ip_tcp_ms | baidu_direct_tcp_ms | "
+        "baidu_via_proxy_ms | download_mbps | download_bytes | error"
+    )
+    for result in results:
+        errors = result["errors"]
+        assert isinstance(errors, list)
+        print(
+            f"{result['ip']} | {result['region']} | "
+            f"{format_benchmark_value(result.get('ip_tcp_ms'), ' ms')} | "
+            f"{format_benchmark_value(result.get('baidu_direct_tcp_ms'), ' ms')} | "
+            f"{format_benchmark_value(result.get('baidu_via_proxy_ms'), ' ms')} | "
+            f"{format_benchmark_value(result.get('download_mbps'), ' Mbps')} | "
+            f"{format_benchmark_value(result.get('download_bytes'))} | "
+            f"{'; '.join(errors) if errors else 'OK'}"
+        )
 
 
 async def relay(
@@ -473,12 +758,46 @@ def parse_args() -> ProxyConfig:
         action="store_true",
         help="wrap the TCP connection to the upstream in TLS (off by default to match the Lua script)",
     )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="benchmark built-in or selected upstream IPs and exit",
+    )
+    parser.add_argument(
+        "--benchmark-url",
+        default=DEFAULT_BENCHMARK_URL,
+        help="URL used for the bounded, discard-only download test",
+    )
+    parser.add_argument(
+        "--benchmark-bytes",
+        type=int,
+        default=DEFAULT_BENCHMARK_BYTES,
+        help="maximum bytes to read for each download test",
+    )
+    parser.add_argument(
+        "--benchmark-timeout",
+        type=float,
+        default=DEFAULT_BENCHMARK_TIMEOUT,
+        help="timeout in seconds for each benchmark operation",
+    )
+    parser.add_argument(
+        "--benchmark-workers",
+        type=int,
+        default=DEFAULT_BENCHMARK_WORKERS,
+        help="maximum number of IP benchmarks to run concurrently",
+    )
     args = parser.parse_args()
     for endpoint in args.upstream_ips:
         try:
             ipaddress.ip_address(endpoint)
         except ValueError:
             parser.error(f"--upstream-ip is not a valid IP address: {endpoint}")
+    if args.benchmark_bytes < 1:
+        parser.error("--benchmark-bytes must be positive")
+    if args.benchmark_timeout <= 0:
+        parser.error("--benchmark-timeout must be positive")
+    if args.benchmark_workers < 1:
+        parser.error("--benchmark-workers must be positive")
     args.upstream_ips = tuple(args.upstream_ips)
     return ProxyConfig(**vars(args))
 
@@ -507,7 +826,11 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     try:
-        asyncio.run(run(parse_args()))
+        config = parse_args()
+        if config.benchmark:
+            run_benchmark(config)
+        else:
+            asyncio.run(run(config))
     except KeyboardInterrupt:
         pass
 
